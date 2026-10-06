@@ -1,0 +1,21 @@
+services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: pricing-redis
+    ports:
+      - "6379:6379"
+
+  pricing-engine:
+    build: .
+    container_name: pricing-engine
+    depends_on:
+      - redis
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      UPSTREAM_WEBSOCKET_URL: wss://v3-prod.livefxhub.com/ws/algo
+      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY}
+      UPSTREAM_SECRET_KEY: ${UPSTREAM_SECRET_KEY}
