@@ -5,10 +5,16 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.socket.WebSocketMessage;
+import org.springframework.web.reactive.socket.WebSocketSession;
+import org.springframework.web.reactive.socket.client.ReactorNettyWebSocketClient;
 import reactor.core.publisher.Mono;
-import reactor.netty.http.client.HttpClient;
 
+import java.net.URI;
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 @Component
@@ -23,10 +29,20 @@ public class MarketDataWebSocketClient {
     @Value("${upstream.secret-key}")
     private String secretKey;
 
-    private final ObjectMapper objectMapper =
-            new ObjectMapper();
+    private final ObjectMapper objectMapper;
 
-    private final List<String> symbols = List.of(
+    private final ReactorNettyWebSocketClient webSocketClient;
+
+    private final AtomicBoolean connected =
+            new AtomicBoolean(false);
+
+    private Consumer<MarketTick> tickConsumer;
+
+    /*
+     * Symbols required by the assignment.
+     */
+    private final List<String> symbols = Arrays.asList(
+
             "AUDUSD",
             "AUDCAD",
             "AUDCHF",
@@ -100,91 +116,443 @@ public class MarketDataWebSocketClient {
             "AVXUSD"
     );
 
-    /*
-     * Returns all symbols that the engine subscribes to.
-     */
-    public List<String> getSymbols() {
-        return symbols;
+    public MarketDataWebSocketClient(
+            ObjectMapper objectMapper) {
+
+        this.objectMapper = objectMapper;
+
+        this.webSocketClient =
+                new ReactorNettyWebSocketClient();
     }
 
     /*
-     * Connect to upstream market WebSocket.
+     * Called by MarketDataService.
      */
-    public void connect(Consumer<MarketTick> tickConsumer) {
-        connectWithRetry(tickConsumer, 0);
+    public void connect(
+            Consumer<MarketTick> tickConsumer) {
+
+        this.tickConsumer = tickConsumer;
+
+        connectWithRetry(0);
     }
 
-    private void connectWithRetry(
-            Consumer<MarketTick> tickConsumer,
-            int attempt) {
+    /*
+     * Connect to upstream WebSocket.
+     */
+    private void connectWithRetry(int attempt) {
 
-        HttpClient client = HttpClient.create();
+        if (connected.get()) {
 
-        client.websocket()
-                .uri(websocketUrl)
-                .handle((inbound, outbound) -> {
+            System.out.println(
+                    "Already connected to market WebSocket"
+            );
+
+            return;
+        }
+
+        System.out.println(
+                "Connecting to market WebSocket..."
+        );
+
+        System.out.println(
+                "URL: " + websocketUrl
+        );
+
+        webSocketClient
+                .execute(
+                        URI.create(websocketUrl),
+                        this::handleConnection
+                )
+
+                .doOnSubscribe(subscription ->
+                        System.out.println(
+                                "Opening upstream WebSocket connection..."
+                        )
+                )
+
+                .doOnError(error -> {
+
+                    connected.set(false);
+
+                    System.err.println(
+                            "Market WebSocket error: "
+                                    + error.getMessage()
+                    );
+                })
+
+                .doFinally(signal -> {
+
+                    connected.set(false);
 
                     System.out.println(
-                            "Connected to market WebSocket"
+                            "Market WebSocket closed."
                     );
 
-                    Mono<Void> authentication =
-                            outbound
-                                    .sendString(
-                                            Mono.just(
-                                                    createAuthMessage()
-                                            )
-                                    )
-                                    .then();
-
-                    Mono<Void> receiving =
-                            inbound
-                                    .receive()
-                                    .asString()
-                                    .doOnNext(message ->
-                                            processMessage(
-                                                    message,
-                                                    outbound,
-                                                    tickConsumer
-                                            )
-                                    )
-                                    .then();
-
-                    return authentication.and(receiving);
+                    scheduleReconnect(attempt);
                 })
-                .subscribe(
-                        success -> {
-                            System.out.println(
-                                    "WebSocket connection completed"
-                            );
 
-                            reconnect(
-                                    tickConsumer,
-                                    attempt
-                            );
-                        },
-                        error -> {
-                            System.err.println(
-                                    "WebSocket connection error: "
-                                            + error.getMessage()
-                            );
-
-                            reconnect(
-                                    tickConsumer,
-                                    attempt
-                            );
-                        }
-                );
+                .subscribe();
     }
 
-    private void reconnect(
-            Consumer<MarketTick> tickConsumer,
+    /*
+     * Handle connection.
+     */
+    private Mono<Void> handleConnection(
+            WebSocketSession session) {
+
+        connected.set(true);
+
+        System.out.println(
+                "Connected to market WebSocket"
+        );
+
+        /*
+         * Create authentication JSON.
+         */
+        String authMessage;
+
+        try {
+
+            authMessage =
+                    objectMapper.writeValueAsString(
+                            new AuthRequest(
+                                    "auth",
+                                    apiKey,
+                                    secretKey
+                            )
+                    );
+
+        } catch (Exception e) {
+
+            return Mono.error(e);
+        }
+
+        System.out.println(
+                "Sending authentication request..."
+        );
+
+        /*
+         * Send authentication first.
+         *
+         * Then continuously receive messages.
+         */
+        return session
+                .send(
+                        Mono.just(
+                                session.textMessage(
+                                        authMessage
+                                )
+                        )
+                )
+
+                .thenMany(
+
+                        session.receive()
+
+                                .map(
+                                        WebSocketMessage::getPayloadAsText
+                                )
+
+                                .doOnNext(message -> {
+
+                                    /*
+                                     * Process the message.
+                                     *
+                                     * We intentionally do not print
+                                     * every market tick to the console.
+                                     */
+                                    handleUpstreamMessage(
+                                            session,
+                                            message
+                                    );
+                                })
+                )
+
+                .then();
+    }
+
+    /*
+     * Process messages from upstream.
+     */
+    private void handleUpstreamMessage(
+            WebSocketSession session,
+            String message) {
+
+        try {
+
+            JsonNode root =
+                    objectMapper.readTree(message);
+
+            /*
+             * Authentication successful.
+             */
+            if (isAuthenticationSuccess(root)) {
+
+                System.out.println(
+                        "Authentication successful"
+                );
+
+                sendSubscription(session);
+
+                return;
+            }
+
+            /*
+             * Authentication failure.
+             */
+            if (isAuthenticationFailure(root)) {
+
+                System.err.println(
+                        "Authentication failed: "
+                                + root.path("message").asText(
+                                "Unknown authentication error"
+                        )
+                );
+
+                return;
+            }
+
+            /*
+             * Market price update.
+             */
+            if ("marketPriceUpdate".equalsIgnoreCase(
+                    root.path("event").asText())) {
+
+                MarketTick tick =
+                        parseMarketTick(root);
+
+                if (tick != null) {
+
+                    /*
+                     * Send tick to MarketDataService.
+                     *
+                     * No console printing here because
+                     * market updates can arrive very frequently.
+                     */
+                    if (tickConsumer != null) {
+
+                        tickConsumer.accept(tick);
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+
+            System.err.println(
+                    "Error processing upstream message: "
+                            + e.getMessage()
+            );
+        }
+    }
+
+    /*
+     * Check authentication success.
+     */
+    private boolean isAuthenticationSuccess(
+            JsonNode root) {
+
+        String event =
+                root.path("event").asText("");
+
+        String status =
+                root.path("status").asText("");
+
+        String message =
+                root.path("message").asText("");
+
+        return event.equalsIgnoreCase("authSuccess")
+
+                || event.equalsIgnoreCase("authenticated")
+
+                || status.equalsIgnoreCase("success")
+
+                || message.toLowerCase()
+                .contains("authentication successful")
+
+                || message.toLowerCase()
+                .contains("authenticated");
+    }
+
+    /*
+     * Check authentication failure.
+     */
+    private boolean isAuthenticationFailure(
+            JsonNode root) {
+
+        String event =
+                root.path("event").asText("");
+
+        String status =
+                root.path("status").asText("");
+
+        String message =
+                root.path("message").asText("");
+
+        return event.equalsIgnoreCase("authFailed")
+
+                || event.equalsIgnoreCase(
+                "authenticationFailed")
+
+                || status.equalsIgnoreCase("error")
+
+                || status.equalsIgnoreCase("failed")
+
+                || message.toLowerCase()
+                .contains("authentication failed")
+
+                || message.toLowerCase()
+                .contains("active session");
+    }
+
+    /*
+     * Subscribe to market prices.
+     */
+    private void sendSubscription(
+            WebSocketSession session) {
+
+        try {
+
+            String subscriptionMessage =
+                    objectMapper.writeValueAsString(
+
+                            new SubscribeRequest(
+                                    "subscribeMarketPrice",
+                                    symbols
+                            )
+                    );
+
+            System.out.println(
+                    "Sending market price subscription..."
+            );
+
+            System.out.println(
+                    "Number of symbols: "
+                            + symbols.size()
+            );
+
+            session.send(
+
+                    Mono.just(
+                            session.textMessage(
+                                    subscriptionMessage
+                            )
+                    )
+
+            ).subscribe(
+
+                    unused -> {
+                    },
+
+                    error ->
+                            System.err.println(
+                                    "Subscription error: "
+                                            + error.getMessage()
+                            ),
+
+                    () ->
+                            System.out.println(
+                                    "Market price subscription sent."
+                            )
+            );
+
+        } catch (Exception e) {
+
+            System.err.println(
+                    "Unable to create subscription: "
+                            + e.getMessage()
+            );
+        }
+    }
+
+    /*
+     * Convert JSON into MarketTick.
+     */
+    private MarketTick parseMarketTick(
+            JsonNode root) {
+
+        String symbol =
+                root.path("symbol").asText(null);
+
+        if (symbol == null
+                || symbol.isBlank()) {
+
+            return null;
+        }
+
+        double bid =
+                root.path("bid").asDouble();
+
+        double ask =
+                root.path("ask").asDouble();
+
+        /*
+         * Ignore invalid prices.
+         */
+        if (bid <= 0 || ask <= 0) {
+
+            System.err.println(
+                    "Invalid price received for "
+                            + symbol
+            );
+
+            return null;
+        }
+
+        MarketTick tick =
+                new MarketTick();
+
+        tick.setSymbol(
+                symbol.toUpperCase()
+        );
+
+        /*
+         * Upstream bid = buy price.
+         */
+        tick.setBuy(bid);
+
+        /*
+         * Upstream ask = sell price.
+         */
+        tick.setSell(ask);
+
+        /*
+         * Do not use upstream 24h values.
+         *
+         * PriceCalculationService calculates
+         * these values.
+         */
+        tick.setHigh24h(0);
+
+        tick.setLow24h(0);
+
+        tick.setChange24h(0);
+
+        /*
+         * Use local receipt timestamp.
+         */
+        tick.setTimestamp(
+                System.currentTimeMillis()
+        );
+
+        return tick;
+    }
+
+    /*
+     * Reconnect with exponential backoff.
+     */
+    private void scheduleReconnect(
             int attempt) {
 
-        int delaySeconds =
+        int nextAttempt =
                 Math.min(
-                        30,
-                        (int) Math.pow(2, Math.min(attempt, 5))
+                        attempt + 1,
+                        5
+                );
+
+        long delaySeconds =
+                Math.min(
+                        (long) Math.pow(2, attempt),
+                        30
                 );
 
         System.out.println(
@@ -193,158 +561,40 @@ public class MarketDataWebSocketClient {
                         + " seconds..."
         );
 
-        reactor.core.scheduler.Schedulers
-                .boundedElastic()
-                .schedule(
-                        () -> connectWithRetry(
-                                tickConsumer,
-                                attempt + 1
-                        ),
-                        delaySeconds,
-                        java.util.concurrent.TimeUnit.SECONDS
-                );
-    }
-    /*
-     * Create authentication JSON.
-     */
-    private String createAuthMessage() {
-
-        return """
-                {
-                  "action":"auth",
-                  "api_key":"%s",
-                  "secret":"%s"
-                }
-                """.formatted(
-                apiKey,
-                secretKey
+        Mono.delay(
+                Duration.ofSeconds(
+                        delaySeconds
+                )
+        )
+        .subscribe(
+                ignored ->
+                        connectWithRetry(
+                                nextAttempt
+                        )
         );
     }
 
     /*
-     * Create subscription JSON.
+     * Return all symbols.
      */
-    private String createSubscriptionMessage() {
+    public List<String> getSymbols() {
 
-        try {
-
-            return objectMapper.writeValueAsString(
-                    new SubscriptionRequest(
-                            "subscribeMarketPrice",
-                            symbols
-                    )
-            );
-
-        } catch (Exception e) {
-
-            throw new RuntimeException(
-                    "Unable to create subscription message",
-                    e
-            );
-        }
+        return symbols;
     }
 
     /*
-     * Process messages received from upstream.
+     * Authentication request.
      */
-    private void processMessage(
-            String message,
-            reactor.netty.NettyOutbound outbound,
-            Consumer<MarketTick> tickConsumer) {
-
-        try {
-
-            JsonNode json =
-                    objectMapper.readTree(message);
-
-            /*
-             * Check authentication response.
-             */
-            if (isAuthenticationSuccessful(json)) {
-
-                System.out.println(
-                        "Authentication successful"
-                );
-
-                /*
-                 * Subscribe only after authentication.
-                 */
-                outbound
-                        .sendString(
-                                Mono.just(
-                                        createSubscriptionMessage()
-                                )
-                        )
-                        .then()
-                        .subscribe();
-
-                return;
-            }
-
-            /*
-             * Ignore messages that are not market ticks.
-             */
-            if (!json.has("symbol")) {
-                return;
-            }
-
-            /*
-             * Convert JSON into MarketTick.
-             */
-            MarketTick tick =
-                    objectMapper.treeToValue(
-                            json,
-                            MarketTick.class
-                    );
-
-            /*
-             * Send tick to calculation service.
-             */
-            tickConsumer.accept(tick);
-
-        } catch (Exception e) {
-
-            System.err.println(
-                    "Error processing market message: "
-                            + e.getMessage()
-            );
-        }
+    private record AuthRequest(
+            String action,
+            String api_key,
+            String secret) {
     }
 
     /*
-     * Detect successful authentication response.
+     * Subscription request.
      */
-    private boolean isAuthenticationSuccessful(
-            JsonNode json) {
-
-        if (json.has("authenticated")) {
-
-            return json
-                    .get("authenticated")
-                    .asBoolean();
-        }
-
-        if (json.has("success")) {
-
-            return json
-                    .get("success")
-                    .asBoolean();
-        }
-
-        if (json.has("status")) {
-
-            return "success".equalsIgnoreCase(
-                    json.get("status").asText()
-            );
-        }
-
-        return false;
-    }
-
-    /*
-     * Object used to create subscription JSON.
-     */
-    private record SubscriptionRequest(
+    private record SubscribeRequest(
             String action,
             List<String> symbols) {
     }

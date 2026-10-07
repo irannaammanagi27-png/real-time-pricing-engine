@@ -19,68 +19,55 @@ public class PriceCalculationService {
     private static final long TWENTY_FOUR_HOURS =
             24 * 60 * 60 * 1000L;
 
-    /*
-     * Represents one price point in our
-     * rolling 24-hour history.
-     */
     private static class PricePoint {
 
         private final long timestamp;
         private final double price;
 
-        private PricePoint(
-                long timestamp,
-                double price) {
-
+        private PricePoint(long timestamp, double price) {
             this.timestamp = timestamp;
             this.price = price;
         }
     }
 
     /*
-     * Normal chronological history.
+     * Stores all price points for each symbol
+     * for the rolling 24-hour window.
+     */
+    private final Map<String, Deque<PricePoint>> priceHistory =
+            new ConcurrentHashMap<>();
+
+    /*
+     * Monotonic deque used to calculate 24-hour high efficiently.
+     */
+    private final Map<String, Deque<PricePoint>> maxHistory =
+            new ConcurrentHashMap<>();
+
+    /*
+     * Monotonic deque used to calculate 24-hour low efficiently.
+     */
+    private final Map<String, Deque<PricePoint>> minHistory =
+            new ConcurrentHashMap<>();
+
+    /*
+     * Stores the latest processed timestamp for each symbol.
+     */
+    private final Map<String, Long> latestTimestamp =
+            new ConcurrentHashMap<>();
+
+    /*
+     * Stores the latest calculated snapshot for each symbol.
      *
-     * Used for calculating the 24-hour
-     * percentage change.
+     * OrderService will use this map to get the
+     * current market price for BUY/SELL orders.
      */
-    private final Map<String, Deque<PricePoint>>
-            priceHistory =
+    private final Map<String, PriceSnapshot> latestSnapshots =
             new ConcurrentHashMap<>();
 
     /*
-     * Monotonic decreasing deque.
-     *
-     * First element is always the
-     * highest price in the window.
+     * Keeps track of symbols whose Redis state has been restored.
      */
-    private final Map<String, Deque<PricePoint>>
-            maxHistory =
-            new ConcurrentHashMap<>();
-
-    /*
-     * Monotonic increasing deque.
-     *
-     * First element is always the
-     * lowest price in the window.
-     */
-    private final Map<String, Deque<PricePoint>>
-            minHistory =
-            new ConcurrentHashMap<>();
-
-    /*
-     * Latest processed timestamp for
-     * each symbol.
-     */
-    private final Map<String, Long>
-            latestTimestamp =
-            new ConcurrentHashMap<>();
-
-    /*
-     * Tracks symbols for which Redis
-     * restoration has completed.
-     */
-    private final Map<String, Boolean>
-            restoredSymbols =
+    private final Map<String, Boolean> restoredSymbols =
             new ConcurrentHashMap<>();
 
     private final PriceStateRepository repository;
@@ -92,25 +79,15 @@ public class PriceCalculationService {
     }
 
     /*
-     * Restore one symbol's history from Redis.
-     *
-     * This method is called during application
-     * startup BEFORE the upstream WebSocket
-     * begins processing live ticks.
+     * Restore 24-hour price history from Redis.
      */
-    public Mono<Void> restoreSymbol(
-            String symbol) {
+    public Mono<Void> restoreSymbol(String symbol) {
 
         return repository
                 .findHistory(symbol)
-
                 .doOnNext(history -> {
 
-                    /*
-                     * No previous history.
-                     */
-                    if (history == null
-                            || history.isEmpty()) {
+                    if (history == null || history.isEmpty()) {
 
                         restoredSymbols.put(
                                 symbol,
@@ -122,50 +99,31 @@ public class PriceCalculationService {
 
                     synchronized (this) {
 
-                        Deque<PricePoint>
-                                priceDeque =
-                                priceHistory
-                                        .computeIfAbsent(
-                                                symbol,
-                                                key ->
-                                                        new ArrayDeque<>()
-                                        );
+                        Deque<PricePoint> priceDeque =
+                                priceHistory.computeIfAbsent(
+                                        symbol,
+                                        key -> new ArrayDeque<>()
+                                );
 
-                        Deque<PricePoint>
-                                maxDeque =
-                                maxHistory
-                                        .computeIfAbsent(
-                                                symbol,
-                                                key ->
-                                                        new ArrayDeque<>()
-                                        );
+                        Deque<PricePoint> maxDeque =
+                                maxHistory.computeIfAbsent(
+                                        symbol,
+                                        key -> new ArrayDeque<>()
+                                );
 
-                        Deque<PricePoint>
-                                minDeque =
-                                minHistory
-                                        .computeIfAbsent(
-                                                symbol,
-                                                key ->
-                                                        new ArrayDeque<>()
-                                        );
+                        Deque<PricePoint> minDeque =
+                                minHistory.computeIfAbsent(
+                                        symbol,
+                                        key -> new ArrayDeque<>()
+                                );
 
-                        /*
-                         * Clear any existing in-memory state.
-                         */
                         priceDeque.clear();
                         maxDeque.clear();
                         minDeque.clear();
 
-                        latestTimestamp.remove(
-                                symbol
-                        );
+                        latestTimestamp.remove(symbol);
 
-                        /*
-                         * Rebuild all in-memory
-                         * data structures.
-                         */
-                        for (
-                                PriceStateRepository.PriceHistoryPoint point
+                        for (PriceStateRepository.PriceHistoryPoint point
                                 : history) {
 
                             PricePoint pricePoint =
@@ -174,15 +132,12 @@ public class PriceCalculationService {
                                             point.getPrice()
                                     );
 
-                            /*
-                             * Normal history.
-                             */
                             priceDeque.addLast(
                                     pricePoint
                             );
 
                             /*
-                             * Rebuild maximum deque.
+                             * Build maximum monotonic deque.
                              */
                             while (!maxDeque.isEmpty()
                                     && maxDeque.peekLast().price
@@ -196,7 +151,7 @@ public class PriceCalculationService {
                             );
 
                             /*
-                             * Rebuild minimum deque.
+                             * Build minimum monotonic deque.
                              */
                             while (!minDeque.isEmpty()
                                     && minDeque.peekLast().price
@@ -209,17 +164,11 @@ public class PriceCalculationService {
                                     pricePoint
                             );
 
-                            /*
-                             * Find latest timestamp.
-                             */
                             Long latest =
-                                    latestTimestamp.get(
-                                            symbol
-                                    );
+                                    latestTimestamp.get(symbol);
 
                             if (latest == null
-                                    || pricePoint.timestamp
-                                    > latest) {
+                                    || pricePoint.timestamp > latest) {
 
                                 latestTimestamp.put(
                                         symbol,
@@ -229,9 +178,6 @@ public class PriceCalculationService {
                         }
                     }
 
-                    /*
-                     * Mark restoration as complete.
-                     */
                     restoredSymbols.put(
                             symbol,
                             true
@@ -242,12 +188,11 @@ public class PriceCalculationService {
                                     + symbol
                     );
                 })
-
                 .then();
     }
 
     /*
-     * Process one live market tick.
+     * Process one incoming market tick.
      */
     public synchronized PriceSnapshot process(
             MarketTick tick) {
@@ -256,46 +201,37 @@ public class PriceCalculationService {
             return null;
         }
 
-        String symbol =
-                tick.getSymbol();
+        String symbol = tick.getSymbol();
 
         /*
          * Validate symbol.
          */
-        if (symbol == null
-                || symbol.isBlank()) {
-
+        if (symbol == null || symbol.isBlank()) {
             return null;
         }
 
         /*
-         * A timestamp is not provided by the
-         * upstream message, so use local
-         * receipt time.
+         * Upstream does not provide a timestamp,
+         * so use the local receipt time.
          */
-        long timestamp =
-                tick.getTimestamp();
+        long timestamp = tick.getTimestamp();
 
         if (timestamp <= 0) {
 
             timestamp =
                     System.currentTimeMillis();
 
-            tick.setTimestamp(
-                    timestamp
-            );
+            tick.setTimestamp(timestamp);
         }
 
         /*
-         * Get previous timestamp.
+         * Get the latest processed timestamp.
          */
         Long previousTimestamp =
-                latestTimestamp.get(
-                        symbol
-                );
+                latestTimestamp.get(symbol);
 
         /*
-         * Ignore out-of-order tick.
+         * Reject out-of-order tick.
          */
         if (previousTimestamp != null
                 && timestamp < previousTimestamp) {
@@ -304,7 +240,7 @@ public class PriceCalculationService {
         }
 
         /*
-         * Ignore duplicate tick timestamp.
+         * Reject duplicate tick.
          */
         if (previousTimestamp != null
                 && timestamp == previousTimestamp) {
@@ -315,40 +251,33 @@ public class PriceCalculationService {
         /*
          * Calculate mid price.
          *
-         * mid = (buy + sell) / 2
+         * mid = (bid + ask) / 2
          */
         double midPrice =
-                (tick.getBuy()
-                        + tick.getSell())
+                (tick.getBuy() + tick.getSell())
                         / 2.0;
 
         /*
-         * Get or create history queues.
+         * Get/create history structures.
          */
         Deque<PricePoint> history =
                 priceHistory.computeIfAbsent(
                         symbol,
-                        key ->
-                                new ArrayDeque<>()
+                        key -> new ArrayDeque<>()
                 );
 
         Deque<PricePoint> maxDeque =
                 maxHistory.computeIfAbsent(
                         symbol,
-                        key ->
-                                new ArrayDeque<>()
+                        key -> new ArrayDeque<>()
                 );
 
         Deque<PricePoint> minDeque =
                 minHistory.computeIfAbsent(
                         symbol,
-                        key ->
-                                new ArrayDeque<>()
+                        key -> new ArrayDeque<>()
                 );
 
-        /*
-         * Create current price point.
-         */
         PricePoint currentPoint =
                 new PricePoint(
                         timestamp,
@@ -356,16 +285,14 @@ public class PriceCalculationService {
                 );
 
         /*
-         * Add to normal history.
+         * Add current price to normal history.
          */
         history.addLast(
                 currentPoint
         );
 
         /*
-         * Maintain maximum deque.
-         *
-         * Remove smaller values from the back.
+         * Maintain maximum monotonic deque.
          */
         while (!maxDeque.isEmpty()
                 && maxDeque.peekLast().price
@@ -379,9 +306,7 @@ public class PriceCalculationService {
         );
 
         /*
-         * Maintain minimum deque.
-         *
-         * Remove larger values from the back.
+         * Maintain minimum monotonic deque.
          */
         while (!minDeque.isEmpty()
                 && minDeque.peekLast().price
@@ -399,11 +324,10 @@ public class PriceCalculationService {
          * the rolling 24-hour window.
          */
         long minimumTimestamp =
-                timestamp
-                        - TWENTY_FOUR_HOURS;
+                timestamp - TWENTY_FOUR_HOURS;
 
         /*
-         * Remove old normal history.
+         * Remove prices older than 24 hours.
          */
         while (!history.isEmpty()
                 && history.peekFirst().timestamp
@@ -413,7 +337,7 @@ public class PriceCalculationService {
         }
 
         /*
-         * Remove old maximum values.
+         * Remove expired maximum candidates.
          */
         while (!maxDeque.isEmpty()
                 && maxDeque.peekFirst().timestamp
@@ -423,7 +347,7 @@ public class PriceCalculationService {
         }
 
         /*
-         * Remove old minimum values.
+         * Remove expired minimum candidates.
          */
         while (!minDeque.isEmpty()
                 && minDeque.peekFirst().timestamp
@@ -433,40 +357,34 @@ public class PriceCalculationService {
         }
 
         /*
-         * Highest price in last 24 hours.
+         * The first element of maxDeque
+         * is the current 24-hour high.
          */
         double high24h =
                 maxDeque.isEmpty()
                         ? midPrice
-                        : maxDeque
-                                .peekFirst()
-                                .price;
+                        : maxDeque.peekFirst().price;
 
         /*
-         * Lowest price in last 24 hours.
+         * The first element of minDeque
+         * is the current 24-hour low.
          */
         double low24h =
                 minDeque.isEmpty()
                         ? midPrice
-                        : minDeque
-                                .peekFirst()
-                                .price;
+                        : minDeque.peekFirst().price;
 
         /*
-         * Oldest price still inside
+         * Oldest price currently inside
          * the 24-hour window.
          */
         double oldPrice =
                 history.isEmpty()
                         ? midPrice
-                        : history
-                                .peekFirst()
-                                .price;
+                        : history.peekFirst().price;
 
         /*
-         * Calculate percentage change.
-         *
-         * ((current - old) / old) * 100
+         * Calculate 24-hour percentage change.
          */
         double change24h = 0.0;
 
@@ -487,7 +405,7 @@ public class PriceCalculationService {
         );
 
         /*
-         * Create output snapshot.
+         * Create final price snapshot.
          */
         PriceSnapshot snapshot =
                 new PriceSnapshot();
@@ -521,7 +439,20 @@ public class PriceCalculationService {
         );
 
         /*
-         * Persist latest snapshot.
+         * IMPORTANT:
+         *
+         * Store latest snapshot in memory.
+         *
+         * OrderService will use this when
+         * placing BUY/SELL market orders.
+         */
+        latestSnapshots.put(
+                symbol,
+                snapshot
+        );
+
+        /*
+         * Save latest snapshot to Redis.
          */
         repository
                 .save(
@@ -531,7 +462,6 @@ public class PriceCalculationService {
                 .subscribe(
                         success -> {
                         },
-
                         error ->
                                 System.err.println(
                                         "Redis snapshot error: "
@@ -540,7 +470,7 @@ public class PriceCalculationService {
                 );
 
         /*
-         * Persist rolling history.
+         * Save rolling 24-hour history to Redis.
          */
         saveHistory(
                 symbol,
@@ -551,8 +481,27 @@ public class PriceCalculationService {
     }
 
     /*
-     * Save the current 24-hour history
-     * to Redis.
+     * Get the latest calculated snapshot
+     * for a particular symbol.
+     *
+     * This method is used by OrderService.
+     */
+    public PriceSnapshot getLatestSnapshot(
+            String symbol) {
+
+        if (symbol == null
+                || symbol.isBlank()) {
+
+            return null;
+        }
+
+        return latestSnapshots.get(
+                symbol
+        );
+    }
+
+    /*
+     * Save price history to Redis.
      */
     private void saveHistory(
             String symbol,
@@ -562,9 +511,7 @@ public class PriceCalculationService {
                 redisHistory =
                 new ArrayList<>();
 
-        for (
-                PricePoint point
-                : history) {
+        for (PricePoint point : history) {
 
             redisHistory.add(
                     new PriceStateRepository.PriceHistoryPoint(
@@ -582,7 +529,6 @@ public class PriceCalculationService {
                 .subscribe(
                         success -> {
                         },
-
                         error ->
                                 System.err.println(
                                         "Redis history error for "
